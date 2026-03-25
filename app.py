@@ -11,10 +11,16 @@ load_dotenv()
 
 APP_TODAY = date(2026, 3, 24)
 
+VALID_BIKE_STATUSES = ["В аренде", "ГАИ", "Кража", "Свободен"]
+VALID_TECH_STATUSES = [
+    "В ремонте",
+    "Исправен",
+    "Ожидает запчасти",
+    "Ожидает ремонта",
+    "Ожидает выездного мастера",
+]
 
-# =========================
-# NEW: DARK PREMIUM THEME
-# =========================
+
 def apply_dark_premium_theme() -> None:
     st.markdown(
         """
@@ -76,18 +82,6 @@ def apply_dark_premium_theme() -> None:
             margin: 6px 0 0 0;
             color: var(--muted);
             font-size: 14px;
-        }
-
-        .premium-chip {
-            display: inline-block;
-            padding: 6px 12px;
-            border-radius: 999px;
-            background: rgba(34,211,238,0.10);
-            border: 1px solid rgba(34,211,238,0.24);
-            color: #D9FBFF;
-            font-size: 12px;
-            font-weight: 700;
-            margin-bottom: 10px;
         }
 
         [data-testid="stMetric"] {
@@ -179,12 +173,6 @@ def apply_dark_premium_theme() -> None:
         hr {
             border-color: rgba(255,255,255,0.06);
         }
-
-        .premium-note {
-            color: var(--muted);
-            font-size: 13px;
-            margin-top: 4px;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -195,7 +183,6 @@ def render_premium_header() -> None:
     st.markdown(
         """
         <div class="premium-title">
-            <div class="premium-chip">Dark Premium • Neon UI</div>
             <h1>Vanta ERP</h1>
             <p>Управление парком, ремонтами, арендой и аналитикой</p>
         </div>
@@ -293,24 +280,27 @@ def normalize_status(value: str | None) -> str:
     raw = str(value or "").strip().lower()
     if raw in {"свободен", "available", "free"}:
         return "Свободен"
-    if raw in {"в ремонте", "repair", "maintenance"}:
-        return "В ремонте"
-    if raw in {"занят", "busy", "rented"}:
-        return "Занят"
-    if raw in {"в аренде"}:
+    if raw in {"в аренде", "rented"}:
         return "В аренде"
-    if raw in {"на дарксторе"}:
-        return "На дарксторе"
-    if raw in {"нужна эвакуация"}:
-        return "Нужна эвакуация"
+    if raw in {"гаи"}:
+        return "ГАИ"
+    if raw in {"кража", "stolen", "theft"}:
+        return "Кража"
     return str(value or "Не указан")
+
+
+def normalize_tech_status(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if raw in VALID_TECH_STATUSES:
+        return raw
+    return raw or "Не указан"
 
 
 def bike_metrics(bikes: list[dict]) -> tuple[int, int, int]:
     free_count = sum(1 for x in bikes if normalize_status(x.get("status")) == "Свободен")
-    repair_count = sum(1 for x in bikes if normalize_status(x.get("status")) == "В ремонте")
-    busy_count = sum(1 for x in bikes if normalize_status(x.get("status")) == "Занят")
-    return free_count, repair_count, busy_count
+    repair_count = sum(1 for x in bikes if normalize_tech_status(x.get("tech_status")) == "В ремонте")
+    rented_count = sum(1 for x in bikes if normalize_status(x.get("status")) == "В аренде")
+    return free_count, repair_count, rented_count
 
 
 def darkstore_number_map(darkstores: list[dict]) -> dict[int, str]:
@@ -348,9 +338,6 @@ def fetch_bike_history(client: Client, bike_id: int) -> list[dict]:
     ]
 
 
-# =========================
-# NEW: BIKE SWAP LOGIC
-# =========================
 def fetch_bike_by_id(client: Client, bike_id: int) -> dict | None:
     try:
         response = client.table("bikes").select("*").eq("id", bike_id).limit(1).execute()
@@ -361,6 +348,64 @@ def fetch_bike_by_id(client: Client, bike_id: int) -> dict | None:
         return None
 
 
+def has_evacuation_ticket(bike_id: int | None, tickets: list[dict]) -> bool:
+    if bike_id is None:
+        return False
+    for ticket in tickets:
+        if ticket.get("bike_id") != bike_id:
+            continue
+        ticket_status = str(ticket.get("status") or "").strip().lower()
+        if ticket_status == "эвакуация":
+            return True
+    return False
+
+
+def display_tech_status(bike: dict, tickets: list[dict] | None = None) -> str:
+    if tickets and has_evacuation_ticket(bike.get("id"), tickets):
+        return "Нужна эвакуация"
+    return normalize_tech_status(bike.get("tech_status"))
+
+
+def mark_bike_for_evacuation(client: Client, bike: dict) -> tuple[bool, str]:
+    bike_id = bike.get("id")
+    if bike_id is None:
+        return False, "Велосипед не найден."
+
+    try:
+        latest = (
+            client.table("repair_tickets")
+            .select("*")
+            .eq("bike_id", bike_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = latest.data or []
+        if rows:
+            ticket_id = rows[0].get("id")
+            if ticket_id is not None:
+                client.table("repair_tickets").update({"status": "Эвакуация"}).eq("id", ticket_id).execute()
+        else:
+            insert_repair_ticket(
+                client,
+                {
+                    "bike_id": bike_id,
+                    "current_darkstore_id": bike.get("current_darkstore_id"),
+                    "plate": bike.get("plate"),
+                    "tech_type": "велосипед",
+                    "problem_desc": "Эвакуация",
+                    "status": "Эвакуация",
+                    "work_type": "repair",
+                    "is_external": True,
+                },
+            )
+
+        client.table("bikes").update({"tech_status": "Ожидает ремонта"}).eq("id", bike_id).execute()
+        return True, "Успешно: байк помечен на эвакуацию."
+    except Exception as error:
+        return False, f"Ошибка: {error}"
+
+
 def swap_bikes(client: Client, old_bike_id: int, new_bike_id: int, transfer_plate: bool = True) -> tuple[bool, str]:
     """
     Переносит со старого байка на новый:
@@ -369,11 +414,6 @@ def swap_bikes(client: Client, old_bike_id: int, new_bike_id: int, transfer_plat
 
     Старому байку ставит:
     - tech_status = 'Ожидает ремонта'
-
-    Дополнительно:
-    - старый байк отвязывается от current_darkstore_id
-    - если plate переносился, у старого plate обнуляется
-    - статус нового байка наследуется от старого, если у старого он есть
     """
     if old_bike_id == new_bike_id:
         return False, "Старый и новый байк не должны совпадать."
@@ -393,6 +433,7 @@ def swap_bikes(client: Client, old_bike_id: int, new_bike_id: int, transfer_plat
     updates_new = {
         "current_darkstore_id": old_darkstore_id,
         "status": old_status,
+        "tech_status": "Исправен",
     }
     if transfer_plate:
         updates_new["plate"] = old_plate
@@ -415,16 +456,12 @@ def swap_bikes(client: Client, old_bike_id: int, new_bike_id: int, transfer_plat
 def status_chip(value: str) -> str:
     if value == "Свободен":
         return "🟢 Свободен"
-    if value == "В ремонте":
-        return "🔴 В ремонте"
-    if value == "Занят":
-        return "🟠 Занят"
     if value == "В аренде":
         return "🔵 В аренде"
-    if value == "На дарксторе":
-        return "🟣 На дарксторе"
-    if value == "Нужна эвакуация":
-        return "🟡 Нужна эвакуация"
+    if value == "ГАИ":
+        return "🟠 ГАИ"
+    if value == "Кража":
+        return "🔴 Кража"
     return f"⚪ {value}"
 
 
@@ -432,12 +469,14 @@ def render_bikes_tab(client: Client) -> None:
     st.subheader("Велосипеды")
     bikes = fetch_table(client, "bikes")
     darkstores = fetch_table(client, "darkstores")
+    tickets = fetch_table(client, "repair_tickets")
     ds_number_by_id = darkstore_number_map(darkstores)
+
     if not bikes:
         st.info("В таблице bikes пока нет данных.")
         return
 
-    awaiting = [b for b in bikes if str(b.get("tech_status") or "").strip() == "Ожидает ремонта"]
+    awaiting = [b for b in bikes if display_tech_status(b, tickets) == "Ожидает ремонта"]
     if awaiting:
         st.markdown("### Фокус мастеров: Ожидает ремонта")
         st.dataframe(
@@ -447,7 +486,7 @@ def render_bikes_tab(client: Client) -> None:
                     "Гос. номер": b.get("plate"),
                     "Даркстор": ds_number_by_id.get(b.get("current_darkstore_id"), "-"),
                     "Статус": normalize_status(b.get("status")),
-                    "Тех. состояние": b.get("tech_status") or "-",
+                    "Тех. состояние": display_tech_status(b, tickets),
                 }
                 for b in awaiting
             ],
@@ -457,11 +496,11 @@ def render_bikes_tab(client: Client) -> None:
         )
 
     c1, c2, c3, c4 = st.columns(4)
-    free_count, repair_count, busy_count = bike_metrics(bikes)
+    free_count, repair_count, rented_count = bike_metrics(bikes)
     c1.metric("Всего", len(bikes))
     c2.metric("Свободно", free_count)
     c3.metric("В ремонте", repair_count)
-    c4.metric("Занято", busy_count)
+    c4.metric("В аренде", rented_count)
 
     f1, f2, f3 = st.columns([2.2, 1.2, 1.2])
     with f1:
@@ -470,7 +509,7 @@ def render_bikes_tab(client: Client) -> None:
         status_values = sorted({normalize_status(x.get("status")) for x in bikes})
         status_filter = st.multiselect("Статус", options=status_values)
     with f3:
-        tech_values = sorted({str(x.get("tech_status") or "Не указан") for x in bikes})
+        tech_values = sorted({display_tech_status(x, tickets) for x in bikes})
         tech_filter = st.multiselect("Тех. состояние", options=tech_values)
 
     filtered = bikes
@@ -486,7 +525,7 @@ def render_bikes_tab(client: Client) -> None:
     if status_filter:
         filtered = [x for x in filtered if normalize_status(x.get("status")) in status_filter]
     if tech_filter:
-        filtered = [x for x in filtered if str(x.get("tech_status") or "Не указан") in tech_filter]
+        filtered = [x for x in filtered if display_tech_status(x, tickets) in tech_filter]
 
     header = st.columns([1.2, 1, 1, 1, 1, 1.1, 2.2])
     header[0].markdown("**Серийный номер**")
@@ -502,16 +541,18 @@ def render_bikes_tab(client: Client) -> None:
         bike_id = bike.get("id")
         if bike_id is None:
             continue
+
         details_key = f"show_details_{bike_id}"
         edit_key = f"show_edit_{bike_id}"
 
         row = st.columns([1.2, 1, 1, 1, 1, 1.1, 2.2])
         row[0].write(bike.get("sn") or "-")
         row[1].write(status_chip(normalize_status(bike.get("status"))))
-        row[2].write(str(bike.get("tech_status") or "Не указан"))
+        row[2].write(display_tech_status(bike, tickets))
         row[3].write(str(bike.get("iot") or "-"))
         row[4].write(str(bike.get("plate") or "-"))
         row[5].write(ds_number_by_id.get(bike.get("current_darkstore_id"), "-"))
+
         with row[6]:
             b1, b2, b3 = st.columns(3)
             if b1.button("Изменить", key=f"edit_btn_{bike_id}"):
@@ -528,14 +569,25 @@ def render_bikes_tab(client: Client) -> None:
                     with st.form(f"bike_edit_form_{bike_id}"):
                         edit_iot = st.text_input("IoT", value=bike.get("iot") or "", key=f"edit_iot_{bike_id}")
                         edit_plate = st.text_input("Гос. номер", value=bike.get("plate") or "", key=f"edit_plate_{bike_id}")
-                        edit_status = st.selectbox("Статус", options=["Свободен", "В ремонте", "Занят"])
+                        edit_status = st.selectbox(
+                            "Статус",
+                            options=VALID_BIKE_STATUSES,
+                            index=VALID_BIKE_STATUSES.index(normalize_status(bike.get("status")))
+                            if normalize_status(bike.get("status")) in VALID_BIKE_STATUSES
+                            else 0,
+                        )
                         save_bike = st.form_submit_button("Сохранить")
+
                     if save_bike:
                         try:
                             (
                                 client.table("bikes")
                                 .update(
-                                    {"iot": edit_iot.strip() or None, "plate": edit_plate.strip() or None, "status": edit_status}
+                                    {
+                                        "iot": edit_iot.strip() or None,
+                                        "plate": edit_plate.strip() or None,
+                                        "status": edit_status,
+                                    }
                                 )
                                 .eq("id", bike_id)
                                 .execute()
@@ -592,20 +644,31 @@ def render_repair_tab(client: Client) -> None:
             )
             assembly_comment = st.text_area("Комментарий")
             submit_assembly = st.form_submit_button("Завершить сборку")
+
         if submit_assembly:
             employee_id = employee_map.get(assembly_employee_label)
             if not sn.strip() or employee_id is None:
                 st.error("Укажите SN и выберите мастера.")
                 return
+
             try:
                 bike_resp = (
                     client.table("bikes")
-                    .insert({"sn": sn.strip(), "iot": iot.strip() or None, "plate": plate.strip() or None, "status": "Свободен"})
+                    .insert(
+                        {
+                            "sn": sn.strip(),
+                            "iot": iot.strip() or None,
+                            "plate": plate.strip() or None,
+                            "status": "Свободен",
+                            "tech_status": "Исправен",
+                        }
+                    )
                     .execute()
                 )
                 bike_data = bike_resp.data or []
                 bike_id = bike_data[0].get("id") if bike_data else None
                 work_type = detect_work_type("assembly", 0, assembly_comment)
+
                 if bike_id is not None:
                     insert_repair_ticket(
                         client,
@@ -617,6 +680,7 @@ def render_repair_tab(client: Client) -> None:
                         },
                     )
                     ensure_work_day(client, employee_id)
+
                 st.success("Успешно: сборка сохранена.")
                 st.rerun()
             except Exception as error:
@@ -671,7 +735,7 @@ def render_repair_tab(client: Client) -> None:
             st.error("Выберите велосипед.")
         else:
             try:
-                client.table("bikes").update({"status": "В ремонте"}).eq("id", bike_id).execute()
+                client.table("bikes").update({"tech_status": "В ремонте"}).eq("id", bike_id).execute()
                 st.success("Успешно: ремонт начат.")
             except Exception as error:
                 st.error(f"Ошибка начала ремонта: {error}")
@@ -680,6 +744,7 @@ def render_repair_tab(client: Client) -> None:
         if bike_id is None or employee_id is None:
             st.error("Выберите мастера и велосипед.")
             return
+
         try:
             parts_payload = []
             for row in st.session_state["parts_rows"]:
@@ -710,7 +775,7 @@ def render_repair_tab(client: Client) -> None:
                 client.table("ticket_parts").insert(payload).execute()
                 st.success("Успешно: запчасти добавлены.")
 
-            client.table("bikes").update({"status": "Свободен"}).eq("id", bike_id).execute()
+            client.table("bikes").update({"status": "Свободен", "tech_status": "Исправен"}).eq("id", bike_id).execute()
             ensure_work_day(client, employee_id)
             st.success("Успешно: ремонт завершен.")
 
@@ -731,7 +796,11 @@ def render_field_repairs_tab(client: Client) -> None:
     darkstores = fetch_table(client, "darkstores")
     ds_number_by_id = darkstore_number_map(darkstores)
 
-    external = [t for t in tickets if t.get("is_external") is True or str(t.get("status") or "").lower() == "pending"]
+    external = [
+        t
+        for t in tickets
+        if t.get("is_external") is True or str(t.get("status") or "").lower() in {"pending", "эвакуация"}
+    ]
 
     b_sn_by_id = {b.get("id"): b.get("sn") for b in bikes if b.get("id") is not None}
     b_plate_by_id = {b.get("id"): b.get("plate") for b in bikes if b.get("id") is not None}
@@ -856,6 +925,7 @@ def render_rental_tab(client: Client) -> None:
             selected_free = st.multiselect("Свободные велосипеды", options=free_labels)
         with col_b:
             ds_label = st.selectbox("Даркстор", options=ds_labels, index=None, placeholder="Выберите...")
+
         if st.button("Поставить на даркстор"):
             ds_id = ds_id_by_label.get(ds_label)
             bike_ids = [free_id_by_label[lbl] for lbl in selected_free if free_id_by_label.get(lbl) is not None]
@@ -863,7 +933,7 @@ def render_rental_tab(client: Client) -> None:
                 st.error("Выберите даркстор и велосипеды.")
             else:
                 try:
-                    client.table("bikes").update({"current_darkstore_id": ds_id, "status": "На дарксторе"}).in_("id", bike_ids).execute()
+                    client.table("bikes").update({"current_darkstore_id": ds_id}).in_("id", bike_ids).execute()
                     st.success("Успешно: поставка выполнена.")
                     st.rerun()
                 except Exception as error:
@@ -882,25 +952,37 @@ def render_rental_tab(client: Client) -> None:
         ]
         ds_bike_labels = [x[0] for x in ds_bike_options]
         ds_bike_id_by_label = {x[0]: x[1] for x in ds_bike_options}
+        ds_bike_by_id = {b.get("id"): b for b in ds_bikes}
 
         col_e1, col_e2 = st.columns(2)
         with col_e1:
-            evac_mark_label = st.selectbox("Велосипед (пометить: нужна эвакуация)", options=ds_bike_labels, index=None, placeholder="Выберите...")
+            evac_mark_label = st.selectbox(
+                "Велосипед (пометить: нужна эвакуация)",
+                options=ds_bike_labels,
+                index=None,
+                placeholder="Выберите...",
+            )
         with col_e2:
-            evac_do_label = st.selectbox("Велосипед (сделать вывоз)", options=ds_bike_labels, index=None, placeholder="Выберите...")
+            evac_do_label = st.selectbox(
+                "Велосипед (сделать вывоз)",
+                options=ds_bike_labels,
+                index=None,
+                placeholder="Выберите...",
+            )
 
         e1, e2 = st.columns(2)
         if e1.button("Пометить: нужна эвакуация"):
             bike_id = ds_bike_id_by_label.get(evac_mark_label)
-            if bike_id is None:
+            bike = ds_bike_by_id.get(bike_id)
+            if bike_id is None or bike is None:
                 st.error("Выберите велосипед.")
             else:
-                try:
-                    client.table("bikes").update({"status": "Нужна эвакуация"}).eq("id", bike_id).execute()
-                    st.success("Успешно: пометка поставлена.")
+                ok, message = mark_bike_for_evacuation(client, bike)
+                if ok:
+                    st.success(message)
                     st.rerun()
-                except Exception as error:
-                    st.error(f"Ошибка: {error}")
+                else:
+                    st.error(message)
 
         if e2.button("Выполнить вывоз"):
             bike_id = ds_bike_id_by_label.get(evac_do_label)
@@ -908,7 +990,13 @@ def render_rental_tab(client: Client) -> None:
                 st.error("Выберите велосипед.")
             else:
                 try:
-                    client.table("bikes").update({"current_darkstore_id": None, "status": "Свободен", "tech_status": "Ожидает ремонта"}).eq("id", bike_id).execute()
+                    client.table("bikes").update(
+                        {
+                            "current_darkstore_id": None,
+                            "status": "Свободен",
+                            "tech_status": "Ожидает ремонта",
+                        }
+                    ).eq("id", bike_id).execute()
                     st.success("Успешно: вывоз выполнен, тех. состояние = 'Ожидает ремонта'.")
                     st.rerun()
                 except Exception as error:
@@ -1102,7 +1190,7 @@ def load_curator_context(client: Client) -> tuple[list[dict], list[dict], list[d
 def render_curator_new_request(client: Client) -> None:
     st.markdown("### Новая заявка")
     bikes, darkstores, _, darkstore_id_by_number, darkstore_address_by_id = load_curator_context(client)
-    ds_number_by_id = darkstore_number_map(darkstores)
+
     with st.form("curator_form"):
         darkstore_number = st.text_input("Номер даркстора")
         darkstore_id = darkstore_id_by_number.get(darkstore_number.strip())
@@ -1142,8 +1230,10 @@ def render_curator_new_request(client: Client) -> None:
                     "work_type": "repair",
                 },
             )
+
             if bike_id is not None:
-                client.table("bikes").update({"tech_status": "Нужен ремонт"}).eq("id", bike_id).execute()
+                client.table("bikes").update({"tech_status": "Ожидает выездного мастера"}).eq("id", bike_id).execute()
+
             st.success("Успешно: заявка отправлена в цех.")
             st.rerun()
         except Exception as error:
@@ -1152,10 +1242,12 @@ def render_curator_new_request(client: Client) -> None:
 
 def render_curator_park(client: Client) -> None:
     st.markdown("### Мой парк")
-    bikes, darkstores, _, darkstore_id_by_number, _ = load_curator_context(client)
+    bikes, darkstores, tickets, darkstore_id_by_number, _ = load_curator_context(client)
     ds_number_by_id = darkstore_number_map(darkstores)
+
     park_ds_number = st.text_input("Номер даркстора", key="curator_park_ds_number")
     park_ds_id = darkstore_id_by_number.get(park_ds_number.strip())
+
     if park_ds_id is not None:
         park_rows = [
             {
@@ -1163,7 +1255,7 @@ def render_curator_park(client: Client) -> None:
                 "Гос. номер": x.get("plate"),
                 "Даркстор": ds_number_by_id.get(x.get("current_darkstore_id"), "-"),
                 "Статус": normalize_status(x.get("status")),
-                "Тех. состояние": x.get("tech_status") or "Не указан",
+                "Тех. состояние": display_tech_status(x, tickets),
             }
             for x in bikes
             if x.get("current_darkstore_id") == park_ds_id
@@ -1176,8 +1268,10 @@ def render_curator_park(client: Client) -> None:
 def render_curator_requests(client: Client) -> None:
     st.markdown("### Мои заявки")
     _, _, tickets, darkstore_id_by_number, _ = load_curator_context(client)
+
     req_ds_number = st.text_input("Номер даркстора", key="curator_req_ds_number")
     req_ds_id = darkstore_id_by_number.get(req_ds_number.strip())
+
     if req_ds_id is not None:
         req_rows = [
             {
@@ -1196,8 +1290,6 @@ def render_curator_requests(client: Client) -> None:
 
 
 st.set_page_config(page_title="Vanta ERP", layout="wide")
-
-# NEW: apply theme before rendering UI
 apply_dark_premium_theme()
 render_premium_header()
 
